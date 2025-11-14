@@ -65,9 +65,7 @@
 #define MAX_ENCODER_BUFFER 480
 #endif
 
-#ifndef DISABLE_FLOAT_API
 #define PSEUDO_SNR_THRESHOLD 316.23f    /* 10^(25/10) */
-#endif
 
 typedef struct {
    opus_val32 XX, XY, YY;
@@ -131,9 +129,9 @@ struct OpusEncoder {
     opus_res     delay_buffer[MAX_ENCODER_BUFFER*2];
 #ifndef DISABLE_FLOAT_API
     int          detected_bandwidth;
+#endif
     int          nb_no_activity_ms_Q1;
     opus_val32   peak_signal_energy;
-#endif
 #ifdef ENABLE_DRED
     int          dred_duration;
     int          dred_q0;
@@ -1036,8 +1034,6 @@ static opus_int32 compute_equiv_rate(opus_int32 bitrate, int channels,
    return equiv;
 }
 
-#ifndef DISABLE_FLOAT_API
-
 int is_digital_silence(const opus_res* pcm, int frame_size, int channels, int lsb_depth)
 {
    int silence = 0;
@@ -1120,8 +1116,6 @@ static int decide_dtx_mode(opus_int activity,            /* indicates if this fr
    return 0;
 }
 
-#endif
-
 static int compute_redundancy_bytes(opus_int32 max_data_bytes, opus_int32 bitrate_bps, int frame_rate, int channels)
 {
    int redundancy_bytes_cap;
@@ -1157,9 +1151,9 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
                 opus_int32 dred_bitrate_bps,
 #endif
 #ifndef DISABLE_FLOAT_API
-                AnalysisInfo *analysis_info, int is_silence,
+                AnalysisInfo *analysis_info,
 #endif
-                int redundancy, int celt_to_silk, int prefill,
+                int is_silence, int redundancy, int celt_to_silk, int prefill,
                 opus_int32 equiv_rate, int to_celt);
 
 opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_size,
@@ -1189,8 +1183,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     AnalysisInfo analysis_info;
     int analysis_read_pos_bak=-1;
     int analysis_read_subframe_bak=-1;
-    int is_silence = 0;
 #endif
+    int is_silence = 0;
 #ifdef ENABLE_DRED
     opus_int32 dred_bitrate_bps;
 #endif
@@ -1226,6 +1220,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
 
     if (st->application != OPUS_APPLICATION_RESTRICTED_SILK)
         celt_encoder_ctl(celt_enc, CELT_GET_MODE(&celt_mode));
+    is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
 #ifndef DISABLE_FLOAT_API
     analysis_info.valid = 0;
 #ifdef FIXED_POINT
@@ -1234,17 +1229,12 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     if (st->silk_mode.complexity >= 7 && st->Fs>=16000 && st->Fs<=48000 && st->application != OPUS_APPLICATION_RESTRICTED_SILK)
 #endif
     {
-       is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
        analysis_read_pos_bak = st->analysis.read_pos;
        analysis_read_subframe_bak = st->analysis.read_subframe;
        run_analysis(&st->analysis, celt_mode, analysis_pcm, analysis_size, frame_size,
              c1, c2, analysis_channels, st->Fs,
              lsb_depth, downmix, &analysis_info);
 
-       /* Track the peak signal energy */
-       if (!is_silence && analysis_info.activity_probability > DTX_ACTIVITY_THRESHOLD)
-          st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999f, 15), st->peak_signal_energy),
-                compute_frame_energy(pcm, frame_size, st->channels, st->arch));
     } else if (st->analysis.initialized) {
        tonality_analysis_reset(&st->analysis);
     }
@@ -1257,12 +1247,11 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     (void)downmix;
 #endif
 
-#ifndef DISABLE_FLOAT_API
     /* Reset voice_ratio if this frame is not silent or if analysis is disabled.
      * Otherwise, preserve voice_ratio from the last non-silent frame */
     if (!is_silence)
       st->voice_ratio = -1;
-
+#ifndef DISABLE_FLOAT_API
     st->detected_bandwidth = 0;
     if (analysis_info.valid)
     {
@@ -1295,6 +1284,17 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
     st->voice_ratio = -1;
 #endif
 
+    /* Track the peak signal energy */
+#ifndef DISABLE_FLOAT_API
+    if (!analysis_info.valid || analysis_info.activity_probability > DTX_ACTIVITY_THRESHOLD)
+#endif
+    {
+       if (!is_silence)
+       {
+          st->peak_signal_energy = MAX32(MULT16_32_Q15(QCONST16(0.999f, 15), st->peak_signal_energy),
+                compute_frame_energy(pcm, frame_size, st->channels, st->arch));
+       }
+    }
     if (st->channels==2 && st->force_channels!=1)
        stereo_width = compute_stereo_width(pcm, frame_size, st->Fs, &st->width_mem);
     else
@@ -1440,7 +1440,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
 #ifndef DISABLE_FLOAT_API
     st->silk_mode.useDTX = st->use_dtx && !(analysis_info.valid || is_silence);
 #else
-    st->silk_mode.useDTX = st->use_dtx;
+    st->silk_mode.useDTX = st->use_dtx && !is_silence;
 #endif
 
     /* Mode selection depending on application and signal type */
@@ -1770,21 +1770,20 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
           curr_max = IMIN(max_len_sum-tot_size, curr_max);
 #ifndef DISABLE_FLOAT_API
           if (analysis_read_pos_bak != -1) {
-            is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
             /* Get analysis for current frame. */
             tonality_get_info(&st->analysis, &analysis_info, enc_frame_size);
           }
 #endif
+          is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
 
           tmp_len = opus_encode_frame_native(st, pcm+i*(st->channels*enc_frame_size), enc_frame_size, curr_data, curr_max, float_api, first_frame,
 #ifdef ENABLE_DRED
-          dred_bitrate_bps,
+                    dred_bitrate_bps,
 #endif
 #ifndef DISABLE_FLOAT_API
-          &analysis_info,
-          is_silence,
+                    &analysis_info,
 #endif
-                    frame_redundancy, celt_to_silk, prefill,
+                    is_silence, frame_redundancy, celt_to_silk, prefill,
                     equiv_rate, frame_to_celt
               );
           if (tmp_len<0)
@@ -1819,9 +1818,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_res *pcm, int frame_si
 #endif
 #ifndef DISABLE_FLOAT_API
                 &analysis_info,
-                is_silence,
 #endif
-                redundancy, celt_to_silk, prefill,
+                is_silence, redundancy, celt_to_silk, prefill,
                 equiv_rate, to_celt
           );
       RESTORE_STACK;
@@ -1836,9 +1834,9 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
                 opus_int32 dred_bitrate_bps,
 #endif
 #ifndef DISABLE_FLOAT_API
-                AnalysisInfo *analysis_info, int is_silence,
+                AnalysisInfo *analysis_info,
 #endif
-                int redundancy, int celt_to_silk, int prefill,
+                int is_silence, int redundancy, int celt_to_silk, int prefill,
                 opus_int32 equiv_rate, int to_celt)
 {
     void *silk_enc=NULL;
@@ -1885,12 +1883,12 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
 
     frame_rate = st->Fs/frame_size;
 
-#ifndef DISABLE_FLOAT_API
     if (is_silence)
     {
        activity = !is_silence;
-    } else if (analysis_info->valid)
-    {
+    }
+#ifndef DISABLE_FLOAT_API
+    else if (analysis_info->valid) {
        activity = analysis_info->activity_probability >= DTX_ACTIVITY_THRESHOLD;
        if (!activity)
        {
@@ -1900,6 +1898,11 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
        }
     }
 #endif
+    else if (st->mode == MODE_CELT_ONLY) {
+       opus_val32 noise_energy = compute_frame_energy(pcm, frame_size, st->channels, st->arch);
+       /* Boosting peak energy a bit because we didn't just average the active frames. */
+       activity = 2*st->peak_signal_energy < (QCONST16(PSEUDO_SNR_THRESHOLD, 0) * (opus_val64)noise_energy);
+    }
 
     /* For the first frame at a new SILK bandwidth */
     if (st->silk_bw_switch)
@@ -1997,6 +2000,7 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
 #endif
 
 #ifdef ENABLE_DRED
+    /* Compute the DRED features. Needs to be before SILK because of DTX. */
     if ( st->dred_duration > 0 && st->dred_encoder.loaded ) {
         int frame_size_400Hz;
         /* DRED Encoder */
@@ -2007,7 +2011,7 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
            st->activity_mem[i] = activity;
     } else {
         st->dred_encoder.latents_buffer_fill = 0;
-        OPUS_CLEAR(st->activity_mem, DRED_MAX_FRAMES);
+        OPUS_CLEAR(st->activity_mem, 4*DRED_MAX_FRAMES);
     }
 #endif
 
@@ -2206,6 +2210,13 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
 
         st->silk_mode.opusCanSwitch = st->silk_mode.switchReady && !st->nonfinal_frame;
 
+        if (activity == VAD_NO_DECISION) {
+           activity = (st->silk_mode.signalType != TYPE_NO_VOICE_ACTIVITY);
+#ifdef ENABLE_DRED
+           for (i=0;i<frame_size*400/st->Fs;i++)
+              st->activity_mem[i] = activity;
+#endif
+        }
         if (nBytes==0)
         {
            st->rangeFinal = 0;
@@ -2528,8 +2539,7 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
     st->first = 0;
 
     /* DTX decision */
-#ifndef DISABLE_FLOAT_API
-    if (st->use_dtx && (analysis_info->valid || is_silence))
+    if (st->use_dtx && !st->silk_mode.useDTX)
     {
        if (decide_dtx_mode(activity, &st->nb_no_activity_ms_Q1, 2*1000*frame_size/st->Fs))
        {
@@ -2541,7 +2551,6 @@ static opus_int32 opus_encode_frame_native(OpusEncoder *st, const opus_res *pcm,
     } else {
        st->nb_no_activity_ms_Q1 = 0;
     }
-#endif
 
     /* In the unlikely case that the SILK encoder busted its target, tell
        the decoder to call the PLC */
@@ -3280,12 +3289,10 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
                     *value = silk_enc->state_Fxx[1].sCmn.noSpeechCounter >= NB_SPEECH_FRAMES_BEFORE_DTX;
                 }
             }
-#ifndef DISABLE_FLOAT_API
             else if (st->use_dtx) {
                 /* DTX determined by Opus. */
                 *value = st->nb_no_activity_ms_Q1 >= NB_SPEECH_FRAMES_BEFORE_DTX*20*2;
             }
-#endif
             else {
                 *value = 0;
             }
